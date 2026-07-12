@@ -68,7 +68,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -77,9 +77,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-id <threadId>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -121,7 +121,7 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, max, ultra.`
     );
   }
   return normalized;
@@ -304,6 +304,9 @@ function filterJobsForCurrentClaudeSession(jobs) {
 }
 
 function findLatestResumableTaskJob(jobs) {
+  // Task-scoped on purpose: both `--resume-last` and the rescue candidate feed
+  // /codex:rescue "Continue", which must never route into a review thread.
+  // Reviews are resumed explicitly with `task --resume-id <threadId>`.
   return (
     jobs.find(
       (job) =>
@@ -355,6 +358,12 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   return findLatestTaskThread(workspaceRoot);
 }
 
+function buildReviewThreadName(request, resolvedBase) {
+  const base = request.base || resolvedBase || "";
+  const scope = base ? ` vs ${base}` : "";
+  return `Codex ${request.reviewName ?? "Review"}${scope}`;
+}
+
 async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
@@ -370,6 +379,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      effort: request.effort,
+      threadName: buildReviewThreadName(request, target.baseRef),
       onProgress: request.onProgress
     });
     const payload = {
@@ -411,6 +422,9 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
+    effort: request.effort,
+    persistThread: true,
+    threadName: buildReviewThreadName(request, target.baseRef),
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -464,11 +478,29 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: request.resumeLast || Boolean(request.resumeThreadId)
   });
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
+  let resumeThreadId = request.resumeThreadId ?? null;
+  if (resumeThreadId) {
+    // --resume-id skips resolveLatestTrackedTaskThread's active-job guard, so
+    // reject an explicit id that matches an active tracked job; otherwise the
+    // busy broker falls back to a second app-server and starts a concurrent turn
+    // on the same rollout. A just-queued background job carries the id on
+    // request.resumeThreadId before job.threadId is populated, so match both.
+    const activeMatch = listJobs(workspaceRoot).find(
+      (job) =>
+        (job.threadId === resumeThreadId || job.request?.resumeThreadId === resumeThreadId) &&
+        job.id !== request.jobId &&
+        (job.status === "queued" || job.status === "running")
+    );
+    if (activeMatch) {
+      throw new Error(
+        `Thread ${resumeThreadId} has an active job ${activeMatch.id}. Use /codex:status before resuming it.`
+      );
+    }
+  }
+  if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -601,7 +633,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId, jobId }) {
   return {
     cwd,
     model,
@@ -609,6 +641,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
+    resumeThreadId: resumeThreadId ?? null,
     jobId
   };
 }
@@ -711,7 +744,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -743,7 +776,8 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model: normalizeRequestedModel(options.model),
+        effort: normalizeReasoningEffort(options.effort),
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -761,7 +795,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "resume-id"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -774,20 +808,28 @@ async function handleTask(argv) {
   const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
+  const rawResumeId = options["resume-id"];
+  const resumeThreadId = typeof rawResumeId === "string" ? rawResumeId.trim() : "";
+  if (rawResumeId !== undefined && !resumeThreadId) {
+    throw new Error("--resume-id needs a thread id. Provide one, or use --resume-last or --fresh.");
+  }
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
+  if ((resumeLast || resumeThreadId) && fresh) {
+    throw new Error("Choose either --resume/--resume-last/--resume-id or --fresh.");
+  }
+  if (resumeLast && resumeThreadId) {
+    throw new Error("Choose either --resume-id <threadId> or --resume/--resume-last, not both.");
   }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resumeLast || Boolean(resumeThreadId)
   });
 
   if (options.background) {
     ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
     const request = buildTaskRequest({
@@ -797,6 +839,7 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
+      resumeThreadId,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -815,6 +858,7 @@ async function handleTask(argv) {
         prompt,
         write,
         resumeLast,
+        resumeThreadId,
         jobId: job.id,
         onProgress: progress
       }),

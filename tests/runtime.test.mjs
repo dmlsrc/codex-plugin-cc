@@ -669,6 +669,63 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
   assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
 });
 
+test("task --resume-id rejects an empty thread id instead of starting fresh", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--resume-id=", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /--resume-id needs a thread id/);
+});
+
+test("task --resume-id refuses to resume a thread with an active job", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-queued",
+            status: "queued",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            summary: "Queued background resume",
+            request: { resumeThreadId: "thr_active" },
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--resume-id", "thr_active", "follow up"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" }
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /has an active job task-queued/);
+});
+
 test("session start hook exports the Claude session id, transcript path, and plugin data dir", () => {
   const repo = makeTempDir();
   const envFile = path.join(makeTempDir(), "claude-env.sh");

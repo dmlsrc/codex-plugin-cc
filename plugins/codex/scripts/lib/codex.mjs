@@ -66,6 +66,7 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    config: options.effort ? { model_reasoning_effort: options.effort } : null,
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -1009,8 +1010,9 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
+      effort: options.effort,
       sandbox: "read-only",
-      ephemeral: true,
+      ephemeral: false,
       threadName: options.threadName
     });
     const sourceThreadId = thread.thread.id;
@@ -1113,6 +1115,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
         model: options.model,
+        effort: options.effort,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
