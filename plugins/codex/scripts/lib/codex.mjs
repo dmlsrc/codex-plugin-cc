@@ -99,6 +99,24 @@ function shorten(text, limit = 72) {
   return `${normalized.slice(0, limit - 3)}...`;
 }
 
+// Progress text is never truncated: the log must record exactly what ran and
+// what came back. A short single-line entry stays inline; anything longer or
+// multi-line becomes a delimited block so the log stays readable and
+// unambiguous.
+const LOG_INLINE_LIMIT = 96;
+
+function formatEntry(label, text, kind = "command") {
+  const raw = String(text ?? "").trimEnd();
+  if (!raw) {
+    return `${label}.`;
+  }
+  const inline = raw.replace(/\s+/g, " ").trim();
+  if (!raw.includes("\n") && inline.length <= LOG_INLINE_LIMIT) {
+    return `${label}: ${inline}`;
+  }
+  return `${label}:\n--- begin ${kind} ---\n${raw}\n--- end ${kind} ---`;
+}
+
 function looksLikeVerificationCommand(command) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
     command
@@ -245,7 +263,7 @@ function describeStartedItem(state, item) {
       return { message: `Reviewer started: ${item.review}`, phase: "reviewing" };
     case "commandExecution":
       return {
-        message: `Running command: ${shorten(item.command, 96)}`,
+        message: formatEntry("Running command", item.command),
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
     case "fileChange":
@@ -263,7 +281,7 @@ function describeStartedItem(state, item) {
       return { message: summary, phase: "investigating" };
     }
     case "webSearch":
-      return { message: `Searching: ${shorten(item.query, 96)}`, phase: "investigating" };
+      return { message: formatEntry("Searching", item.query, "query"), phase: "investigating" };
     default:
       return null;
   }
@@ -275,7 +293,7 @@ function describeCompletedItem(state, item) {
       const exitCode = item.exitCode ?? "?";
       const statusLabel = item.status === "completed" ? "completed" : item.status;
       return {
-        message: `Command ${statusLabel}: ${shorten(item.command, 96)} (exit ${exitCode})`,
+        message: formatEntry(`Command ${statusLabel} (exit ${exitCode})`, item.command),
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
     }
@@ -436,11 +454,13 @@ function recordItem(state, item, lifecycle, threadId = null) {
       if (lifecycle === "completed") {
         const sourceLabel = labelForThread(state, threadId);
         emitLogEvent(state.onProgress, {
-          message: sourceLabel ? `Subagent ${sourceLabel}: ${shorten(item.text, 96)}` : `Assistant message captured: ${shorten(item.text, 96)}`,
+          message: formatEntry(
+            sourceLabel ? `Subagent ${sourceLabel}` : "Assistant message captured",
+            item.text,
+            "message"
+          ),
           stderrMessage: null,
-          phase: item.phase === "final_answer" ? "finalizing" : null,
-          logTitle: sourceLabel ? `Subagent ${sourceLabel} message` : "Assistant message",
-          logBody: item.text
+          phase: item.phase === "final_answer" ? "finalizing" : null
         });
       }
     }
@@ -467,12 +487,12 @@ function recordItem(state, item, lifecycle, threadId = null) {
     if (nextSections.length > 0) {
       const sourceLabel = labelForThread(state, threadId);
       emitLogEvent(state.onProgress, {
-        message: sourceLabel
-          ? `Subagent ${sourceLabel} reasoning: ${shorten(nextSections[0], 96)}`
-          : `Reasoning summary captured: ${shorten(nextSections[0], 96)}`,
-        stderrMessage: null,
-        logTitle: sourceLabel ? `Subagent ${sourceLabel} reasoning summary` : "Reasoning summary",
-        logBody: nextSections.map((section) => `- ${section}`).join("\n")
+        message: formatEntry(
+          sourceLabel ? `Subagent ${sourceLabel} reasoning` : "Reasoning summary captured",
+          nextSections.map((section) => `- ${section}`).join("\n"),
+          "reasoning"
+        ),
+        stderrMessage: null
       });
     }
     return;
